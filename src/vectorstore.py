@@ -32,8 +32,13 @@ class FaissVectorStore:
             chunk_overlap=self.chunk_overlap,
         )
         chunks = emb_pipe.chunk_documents(documents)
-        embeddings = emb_pipe.embed_chunks(chunks)
-        metadatas = [{"texts": chunk.page_content} for chunk in chunks]
+        embeddings, valid_chunks = emb_pipe.embed_chunks(chunks)
+        
+        if len(valid_chunks) == 0:
+            print("[WARNING] No valid chunks were embedded. Vector store will not be updated.")
+            return
+
+        metadatas = [{"texts": chunk.page_content} for chunk in valid_chunks]
         self.add_embeddings(np.array(embeddings).astype("float32"), metadatas)
         self.save()
         print(f"[INFO] Vector Store built and saved to {self.persist_dir}")
