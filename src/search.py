@@ -78,23 +78,18 @@ class RAGSearch:
         return out
 
     def summarize(self, query: str, retrieved: List[RetrievalResult]) -> str:
-        if not retrieved:
-            return "No documents are available in the vector store. Please add some documents to the data directory and restart the application."
-            
         texts = [r.text for r in retrieved if r.text]
         context = "\n\n".join(texts)
-        if not context:
-            return "No relevant documents found for your query."
         
         # Using proper message formatting for better LLM interaction
-        system_message = SystemMessage(content="You are a helpful assistant that summarizes documents based on queries. Provide clear, concise summaries with relevant quotes when appropriate.")
+        system_message = SystemMessage(content="You are a helpful assistant. Use the provided context to answer the user's question if the information is present. If the answer is not in the context, or if the context is empty, answer the question using your own knowledge.")
         human_message = HumanMessage(content=f"""
-Based on the following context, answer the query: '{query}'
-
 Context:
 {context}
 
-Please provide a comprehensive answer based solely on the provided context. If you quote specific information, indicate it clearly.
+Query: {query}
+
+Answer:
 """)
         
         try:
