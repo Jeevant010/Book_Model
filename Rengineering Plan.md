@@ -1,0 +1,1 @@
+*** Here you will see the plan for a advanced rag pipeline with a very optimistic search strategy***
