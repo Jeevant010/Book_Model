@@ -5,6 +5,8 @@ import pickle
 from typing import List, Any
 from sentence_transformers import SentenceTransformer
 from src.embedding import EmbeddingPipeline
+from pinecone import Pinecone
+from pinecone_text.sparse import BM25Encoder
 
 class FaissVectorStore:
     def __init__(
@@ -98,6 +100,62 @@ class FaissVectorStore:
         print(f"[INFO] Querying vector store for: '{query_text}'")
         query_emb = self.model.encode([query_text]).astype("float32")
         return self.search(query_emb, top_k=top_k)
+
+class PineconeVectorStore:
+    def __init__(
+        self,
+        index_name: str,
+        embedding_model: str = "all-MiniLM-L6-v2",
+    ):
+        self.index_name = index_name
+        self.embedding_model = embedding_model
+        
+        # Load models
+        print(f"[INFO] Loaded dense embedding model: {embedding_model}")
+        self.model = SentenceTransformer(embedding_model)
+        print(f"[INFO] Loaded sparse BM25Encoder vocabulary")
+        self.bm25 = BM25Encoder().default()
+        
+        api_key = os.getenv("PINECONE_API_KEY")
+        if not api_key:
+            print("[WARNING] PINECONE_API_KEY not set. Pinecone may fail to initialize.")
+            
+        self.pc = Pinecone(api_key=api_key)
+        self.index = self.pc.Index(self.index_name)
+
+    def search(self, query_text: str, top_k: int = 5, metadata_filter: dict = None):
+        """
+        Executes a Hybrid Search via Pinecone using Reciprocal Rank Fusion / Alpha Fusion
+        """
+        print(f"[INFO] Hybrid querying Pinecone for: '{query_text}'")
+        
+        # 1. Dense query
+        dense_vec = self.model.encode([query_text])[0].tolist()
+        
+        # 2. Sparse query
+        sparse_vec = self.bm25.encode_queries([query_text])[0]
+        
+        # 3. Hybrid search
+        response = self.index.query(
+            vector=dense_vec,
+            sparse_vector=sparse_vec,
+            top_k=top_k,
+            include_metadata=True,
+            filter=metadata_filter
+        )
+        
+        results = []
+        for match in response['matches']:
+            results.append({
+                "index": match['id'],
+                "distance": float(match['score']),
+                "metadata": match['metadata']
+            })
+            
+        return results
+
+    def query(self, query_text: str, top_k: int = 5, metadata_filter: dict = None):
+        return self.search(query_text, top_k=top_k, metadata_filter=metadata_filter)
 
 if __name__ == "__main__":
     from src.data_loader import load_all_documents
