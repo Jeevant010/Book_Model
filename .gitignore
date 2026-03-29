@@ -24,6 +24,9 @@ __pycache__/
 # faiss_store/
 vector_store/
 
+# Keep raw source books local only
+Data/
+
 # LangGraph
 .langgraph_api/
 Data/

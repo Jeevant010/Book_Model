@@ -1,12 +1,24 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.documents import Document
 
-from src.vectorstore import FaissVectorStore
+# LangChain's document compressor module changed across versions.
+# Avoid hard failure if unavailable (often absent in langchain 1.x minimal installs).
+LLMChainExtractor = None
+try:
+    from langchain.retrievers.document_compressors import LLMChainExtractor
+except ModuleNotFoundError:
+    try:
+        from langchain_experimental.compression import LLMChainExtractor
+    except ModuleNotFoundError:
+        LLMChainExtractor = None
+
+from src.vectorstore import FaissVectorStore, PineconeVectorStore
 
 load_dotenv()
 
@@ -24,36 +36,44 @@ class RAGSearch:
         llm_model: str = "llama-3.1-8b-instant",
     ):
         # Vector store setup
-        self.vectorstore = FaissVectorStore(persist_dir=persist_dir, embedding_model=embedding_model)
+        vector_store_type = os.getenv("VECTOR_STORE", "faiss").lower()
+        self.vector_store_type = "faiss"
 
-        faiss_path = os.path.join(persist_dir, "faiss.index")
-        meta_path = os.path.join(persist_dir, "metadata.pkl")
-
-        if not (os.path.exists(faiss_path) and os.path.exists(meta_path)):
-            # Build from local 'Research/data' directory if index doesn't exist  
-            from src.data_loader import load_all_documents
-            # Try multiple possible data directories
-            data_dirs = ["Research/data", "data", "Data"]
-            docs = []
-            
-            for data_dir in data_dirs:
-                if os.path.exists(data_dir):
-                    print(f"[INFO] Checking for documents in: {data_dir}")
-                    docs = load_all_documents(data_dir)
-                    if docs:
-                        print(f"[INFO] Found {len(docs)} documents in {data_dir}")
-                        break
-                        
-            if not docs:
-                print("[WARNING] No documents found in any data directory. Vector store will be empty.")
-                print("[INFO] Please add documents to 'Research/data/', 'data/', or 'Data/' directory.")
-                # Create empty index for now
-                self.vectorstore.index = None
-                self.vectorstore.metadata = []
-            else:
-                self.vectorstore.build_from_documents(docs)
+        if vector_store_type == "pinecone" and os.getenv("PINECONE_API_KEY"):
+            pinecone_index = os.getenv("PINECONE_INDEX_NAME", "book-model-index")
+            print(f"[INFO] Using Pinecone Vector Store (Index: {pinecone_index})")
+            self.vectorstore = PineconeVectorStore(index_name=pinecone_index, embedding_model=embedding_model)
+            self.vector_store_type = "pinecone"
         else:
-            self.vectorstore.load()
+            if vector_store_type == "pinecone" and not os.getenv("PINECONE_API_KEY"):
+                print("[WARN] VECTOR_STORE is pinecone but PINECONE_API_KEY is missing. Falling back to local FAISS.")
+            print("[INFO] Using Local FAISS Vector Store")
+            self.vectorstore = FaissVectorStore(persist_dir=persist_dir, embedding_model=embedding_model)
+            faiss_path = os.path.join(persist_dir, "faiss.index")
+            meta_path = os.path.join(persist_dir, "metadata.pkl")
+
+            if not (os.path.exists(faiss_path) and os.path.exists(meta_path)):
+                # Build from local data directory if index doesn't exist  
+                from src.data_loader import load_all_documents
+                data_dirs = ["Research/data", "data", "Data"]
+                docs = []
+                
+                for data_dir in data_dirs:
+                    if os.path.exists(data_dir):
+                        print(f"[INFO] Checking for documents in: {data_dir}")
+                        docs = load_all_documents(data_dir)
+                        if docs:
+                            print(f"[INFO] Found {len(docs)} documents in {data_dir}")
+                            break
+                            
+                if not docs:
+                    print("[WARNING] No documents found in any data directory. Vector store will be empty.")
+                    self.vectorstore.index = None
+                    self.vectorstore.metadata = []
+                else:
+                    self.vectorstore.build_from_documents(docs)
+            else:
+                self.vectorstore.load()
 
         # LLM setup
         groq_api_key = os.getenv("GROQ_API_KEY")
@@ -64,37 +84,113 @@ class RAGSearch:
         self.llm = ChatGroq(api_key=groq_api_key, model=llm_model, temperature=0.1)
         print(f"[INFO] Groq LLM initialized: {llm_model}")
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[RetrievalResult]:
-        # Check if vector store is empty
-        if self.vectorstore.index is None or len(self.vectorstore.metadata) == 0:
+    def retrieve(
+        self, 
+        query: str, 
+        top_k: int = 5, 
+        metadata_filter: Optional[Dict[str, str]] = None
+    ) -> List[RetrievalResult]:
+        """
+        Retrieve relevant documents. If Pinecone is used, it applies metadata_filter natively.
+        If FAISS is used, it falls back to post-filtering.
+        """
+        if getattr(self.vectorstore, "index", False) is None:
             print("[WARNING] Vector store is empty. No documents to search.")
             return []
+        
+        is_pinecone = self.vector_store_type == "pinecone"
+        
+        if is_pinecone:
+            # Native Pre-Filtering for Pinecone
+            results = self.vectorstore.query(
+                query_text=query, 
+                top_k=top_k, 
+                metadata_filter=metadata_filter
+            )
+        else:
+            # Post-Filtering for FAISS
+            fetch_k = top_k * 3 if metadata_filter else top_k
+            results = self.vectorstore.query(query_text=query, top_k=fetch_k)
             
-        results = self.vectorstore.query(query_text=query, top_k=top_k)
         out: List[RetrievalResult] = []
         for r in results:
-            text = r["metadata"]["texts"] if r.get("metadata") and r["metadata"].get("texts") else None
-            out.append(RetrievalResult(index=int(r["index"]), distance=float(r["distance"]), text=text))
+            meta = r.get("metadata", {}) or {}
+            text = meta.get("texts")
+            
+            # Apply post filter only if it's not pinecone
+            if not is_pinecone and metadata_filter:
+                matches = True
+                for key, value in metadata_filter.items():
+                    meta_value = meta.get(key, "")
+                    if meta_value and value.lower() not in str(meta_value).lower():
+                        matches = False
+                        break
+                if not matches:
+                    continue
+            
+            out.append(RetrievalResult(
+                index=int(r.get("index", 0) if "index" in r else 0), 
+                distance=float(r.get("distance", 0.0)), 
+                text=text
+            ))
+            
+            if len(out) >= top_k:
+                break
+        
         return out
 
-    def summarize(self, query: str, retrieved: List[RetrievalResult]) -> str:
-        if not retrieved:
-            return "No documents are available in the vector store. Please add some documents to the data directory and restart the application."
-            
-        texts = [r.text for r in retrieved if r.text]
-        context = "\n\n".join(texts)
-        if not context:
-            return "No relevant documents found for your query."
+    def _compress_context(self, query: str, texts: List[str]) -> str:
+        """
+        Contextual Compression: Uses LangChain LLMChainExtractor to dynamically
+        strip irrelevant sentences from the fetched chunks.
+        """
+        if not texts:
+            return ""
         
-        # Using proper message formatting for better LLM interaction
-        system_message = SystemMessage(content="You are a helpful assistant that summarizes documents based on queries. Provide clear, concise summaries with relevant quotes when appropriate.")
-        human_message = HumanMessage(content=f"""
-Based on the following context, answer the query: '{query}'
+        raw_context = "\n\n---\n\n".join(texts)
+        if len(raw_context) < 500:
+            return raw_context
 
+        if LLMChainExtractor is None:
+            print("[INFO] LLMChainExtractor not available, skipping context compression")
+            return raw_context
+
+        try:
+            compressor = LLMChainExtractor.from_llm(self.llm)
+            docs = [Document(page_content=t) for t in texts]
+
+            # This uses Groq to extract relevant phrases natively
+            compressed_docs = compressor.compress_documents(docs, query)
+
+            if compressed_docs:
+                compressed_text = "\n\n---\n\n".join([d.page_content for d in compressed_docs])
+                saved_pct = round((1 - len(compressed_text) / len(raw_context)) * 100)
+                if saved_pct > 0:
+                    print(f"[INFO] Context compressed using LangChain: saved {saved_pct}% tokens")
+                return compressed_text
+        except Exception as e:
+            print(f"[WARN] LangChain context compression failed, using raw context: {e}")
+
+        return raw_context
+
+    def summarize(self, query: str, retrieved: List[RetrievalResult]) -> str:
+        texts = [r.text for r in retrieved if r.text]
+        
+        # Apply contextual compression to reduce irrelevant content
+        context = self._compress_context(query, texts)
+        
+        system_message = SystemMessage(content=(
+            "You are a helpful assistant. Use the provided context to answer the user's question "
+            "if the information is present. If the answer is not in the context, or if the context "
+            "is empty, answer the question using your own knowledge."
+        ))
+        human_message = HumanMessage(content=f"""
 Context:
 {context}
 
-Please provide a comprehensive answer based solely on the provided context. If you quote specific information, indicate it clearly.
+Query: {query}
+
+Answer:
 """)
         
         try:

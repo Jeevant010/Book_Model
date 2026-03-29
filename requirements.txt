@@ -11,6 +11,10 @@ pypdf>=4.0.1
 # Embeddings and vector databases
 sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
+pinecone-client>=3.0.0
+pinecone-text>=0.8.0
+langchain-pinecone>=0.1.0
+rank-bm25>=0.2.2
 
 # Web framework and API
 fastapi>=0.115.0
