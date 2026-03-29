@@ -26,3 +26,4 @@ vector_store/
 
 # LangGraph
 .langgraph_api/
+Data/
