@@ -53,3 +53,5 @@ Set `GROQ_API_KEY` as a **Secret** in your Hugging Face Space settings.
 - **SentenceTransformers** — embedding model (`all-MiniLM-L6-v2`)
 - **Groq** — LLM inference (`llama-3.1-8b-instant`)
 - **LangChain** — document loading & text splitting
+
+Signing off jeevant010 as services are shifted
